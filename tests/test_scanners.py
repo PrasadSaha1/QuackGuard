@@ -126,7 +126,7 @@ def test_http_transport_uses_one_explicit_destination(monkeypatch, status, decis
 
     session = Mock()
     session.post.return_value.status_code = status
-    session.post.return_value.json.return_value = reply("safe")
+    session.post.return_value.iter_content.return_value = [b'{"choices":[{"message":{"content":"safe"}}]}']
     requests = MagicMock()
     requests.Session.return_value.__enter__.return_value = session
     monkeypatch.setitem(sys.modules, "requests", requests)
@@ -137,6 +137,25 @@ def test_http_transport_uses_one_explicit_destination(monkeypatch, status, decis
     assert session.trust_env is False
     session.post.assert_called_once_with(
         endpoint, json={"model": "fixture-model", "messages": [{"role": "user", "content": "fixture"}]},
-        headers={"Authorization": "Bearer fixture-key"}, timeout=3.0, allow_redirects=False)
+        headers={"Authorization": "Bearer fixture-key"}, timeout=3.0, allow_redirects=False, stream=True)
     if status != 200:
-        session.post.return_value.json.assert_not_called()
+        session.post.return_value.iter_content.assert_not_called()
+
+
+def test_oversized_http_classification_stops_reading(monkeypatch):
+    import sys
+    from unittest.mock import MagicMock
+
+    def chunks(_):
+        for _ in range(9):
+            yield b" " * 8192
+        pytest.fail("The adapter continued reading after reaching its limit.")
+
+    requests = MagicMock()
+    response = requests.Session.return_value.__enter__.return_value.post.return_value
+    response.status_code = 200
+    response.iter_content.side_effect = chunks
+    monkeypatch.setitem(sys.modules, "requests", requests)
+    monkeypatch.setenv("QUACKGUARD_API_KEY", "synthetic")
+    guard = Guard(LlamaGuardScanner(endpoint="https://model.example.test/scan", model="fixture"))
+    assert guard.scan_output("untrusted").verdict is Verdict.UNAVAILABLE
