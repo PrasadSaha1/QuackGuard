@@ -1,10 +1,11 @@
-"""Local decision, review, and execution lifecycle for registered email tools."""
+"""Local decision, review, and execution lifecycle for application-owned tools."""
 
 from __future__ import annotations
 
+import inspect
 import math
 import re
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -12,8 +13,9 @@ from threading import Lock
 from time import monotonic, perf_counter
 from uuid import uuid4
 
+from .ledger import LedgerUnavailable, SQLiteLedger
 from .scanners import Scanner
-from .tools import AlignmentCheck, EmailTool
+from .tools import AlignmentCheck, BoundTool, EmailTool, Tool
 from .types import (
     Alignment, AlignmentResult, Classification, Decision, Direction, Event, Execution,
     Permission, ScanResult, Stats, ToolRequest, ToolResult, UserDecision, Verdict,
@@ -24,7 +26,8 @@ from .types import (
 class _Proposal:
     request: ToolRequest
     name: str | None
-    deadline: float
+    key: str | None = field(repr=False)
+    deadline: float = math.inf
     id: str = field(default_factory=lambda: uuid4().hex)
     result: ToolResult | None = None
     lock: Lock = field(default_factory=Lock)
@@ -38,22 +41,30 @@ _SCAN = {
 
 
 class Guard:
-    def __init__(self, scanner: Scanner, *, tools: Mapping[str, EmailTool] | None = None,
+    def __init__(self, scanner: Scanner, *, tools: Mapping[str, Tool | EmailTool] | None = None,
                  alignment: AlignmentCheck | None = None, review_ttl: float = 300,
-                 clock: Callable[[], float] = monotonic):
+                 clock: Callable[[], float] = monotonic, ledger: SQLiteLedger | None = None,
+                 max_events: int = 1000, max_pending: int = 256):
         self._scanner = scanner
         self._tools = dict(tools or {})
         if any(type(name) is not str or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name)
-               or type(tool) is not EmailTool for name, tool in self._tools.items()):
-            raise ValueError("Register email tools using short application-defined identifiers.")
+               or type(tool) not in (Tool, EmailTool) for name, tool in self._tools.items()):
+            raise ValueError("Register tools using short application-defined identifiers.")
         if type(review_ttl) not in (int, float) or not math.isfinite(review_ttl) or review_ttl <= 0:
             raise ValueError("Review lifetime must be finite and positive.")
+        if any(type(limit) is not int or limit < 1 for limit in (max_events, max_pending)):
+            raise ValueError("Activity and pending review limits must be positive integers.")
+        self._max_pending = max_pending
+        self._ledger = ledger
         self._alignment = alignment
         self._clock = clock
         self._ttl = review_ttl
         self._lock = Lock()
         self._pending: dict[str, _Proposal] = {}
-        self._events: list[Event] = []
+        self._events: deque[Event] = deque(maxlen=max_events)
+        self._scan_directions: Counter[Direction] = Counter()
+        self._verdicts: Counter[Verdict] = Counter()
+        self._executions: Counter[Execution] = Counter()
         self._decisions: Counter[Decision] = Counter()
 
     @property
@@ -67,7 +78,7 @@ class Guard:
     def scan_output(self, text: str) -> ScanResult:
         return self._scan(Direction.OUTPUT, text)
 
-    def _scan(self, direction: Direction, text: str) -> ScanResult:
+    def _scan(self, direction: Direction, text: object, *, proposal: _Proposal | None = None) -> ScanResult:
         start = perf_counter()
         try:
             if type(text) is not str:
@@ -80,17 +91,25 @@ class Guard:
         decision, reason, explanation = _SCAN[classification.verdict]
         with self._lock:
             self._events.append(Event(datetime.now(timezone.utc), direction.value, decision, reason,
-                                      (perf_counter() - start) * 1000))
+                                      (perf_counter() - start) * 1000,
+                                      proposal.name if proposal else None, proposal.id if proposal else None))
+            self._scan_directions[direction] += 1
+            self._verdicts[classification.verdict] += 1
         return ScanResult(direction, classification.verdict, decision, reason, explanation,
                           classification.categories)
 
-    def run_tool(self, request: ToolRequest) -> ToolResult:
+    def run_tool(self, request: ToolRequest, *, idempotency_key: str | None = None) -> ToolResult:
         """Submit a new proposal. The application registers the callable in advance."""
         if type(request) is not ToolRequest:
             raise TypeError("Expected a validated ToolRequest.")
+        if self._ledger is not None:
+            self._ledger.validate_key(idempotency_key)
+        elif idempotency_key is not None:
+            raise ValueError("Configure a ledger to use idempotency keys.")
+        self._expire_pending()
         # Only a trusted registry identifier may enter events.
         name = request.tool_name if request.tool_name in self._tools else None
-        proposal = _Proposal(request, name, self._clock() + self._ttl)
+        proposal = _Proposal(request, name, idempotency_key)
         with proposal.lock:
             return self._evaluate(proposal)
 
@@ -123,7 +142,7 @@ class Guard:
             elif recheck:
                 return self._evaluate(proposal, reviewing=True)
             elif decision is not UserDecision.ALLOW or previous.reason_code in {
-                    "alignment_unavailable", "permission_unavailable"}:
+                    "alignment_unavailable", "permission_unavailable", "validator_unavailable", "ledger_unavailable"}:
                 return previous
             else:
                 return self._evaluate(proposal, reviewing=True, approved=True)
@@ -142,19 +161,26 @@ class Guard:
 
         if proposal.name is None:
             return record("permission", Decision.BLOCK, "unregistered_tool", "This tool is not registered.")
-        tool = self._tools[proposal.name]
         try:
-            permission = tool.permission(proposal.request.arguments)
+            tool = self._tools[proposal.name].bind(proposal.request.arguments)
+        except Exception:
+            return record("validation", Decision.REVIEW, "validator_unavailable",
+                          "The application could not complete argument validation.")
+        if tool is None:
+            return record("validation", Decision.BLOCK, "invalid_arguments",
+                          "The proposed arguments do not match this tool's schema.")
+        try:
+            permission = tool.permission()
             if type(permission) is not Permission:
                 permission = None
         except Exception:
             permission = None
         if permission is None:
             return record("permission", Decision.REVIEW, "permission_unavailable",
-                          "The permission check must complete before this email can be sent.")
+                          "The permission check must complete before this tool can run.")
         if permission is Permission.DENY:
             return record("permission", Decision.BLOCK, "policy_denied",
-                          "The application policy denies this email.")
+                          "The application policy denies this action.")
         try:
             result = self._alignment.check(proposal.request) if self._alignment else None
             alignment = result.verdict if type(result) is AlignmentResult else Alignment.UNAVAILABLE
@@ -162,50 +188,106 @@ class Guard:
             alignment = Alignment.UNAVAILABLE
         if alignment is Alignment.MISALIGNED:
             return record("alignment", Decision.BLOCK, "misaligned_action",
-                          "Sending this email conflicts with the original user request.")
+                          "This action conflicts with the original user request.")
         if alignment is Alignment.UNAVAILABLE:
             return record("alignment", Decision.REVIEW, "alignment_unavailable",
-                          "The intent check must complete before this email can be sent.")
+                          "The intent check must complete before this tool can run.")
         if reviewing and self._clock() >= proposal.deadline:
             return record("approval", Decision.BLOCK, "approval_expired", "The review period expired.")
+        if self._ledger is not None and proposal.key is not None and reviewing:
+            try:
+                self._ledger.status(proposal.key)
+            except LedgerUnavailable:
+                return record("admission", Decision.REVIEW, "ledger_unavailable",
+                              "The execution ledger must be available before this tool can run.")
         if not approved:
             if alignment is Alignment.UNCERTAIN:
                 return record("alignment", Decision.REVIEW, "alignment_uncertain",
-                              "Confirm that this exact email is what you intended.")
+                              "Confirm that this exact action is what you intended.")
             if permission is Permission.ASK or reviewing:
                 return record("approval", Decision.REVIEW, "user_approval_required",
-                              "The user must approve this exact email before it can be sent.")
+                              "The user must approve this exact action before the tool can run.")
+        if self._ledger is not None and proposal.key is not None:
+            try:
+                conflict = self._ledger.claim(proposal.key, proposal.request)
+            except LedgerUnavailable:
+                return record("admission", Decision.REVIEW, "ledger_unavailable",
+                              "The execution ledger could not reserve this action.")
+            if conflict == "duplicate_execution":
+                return record("admission", Decision.BLOCK, conflict,
+                              "An earlier attempt already reserved this action.")
+            if conflict == "idempotency_conflict":
+                return record("admission", Decision.BLOCK, conflict,
+                              "This operation key belongs to a different action.")
+            if reviewing and self._clock() >= proposal.deadline:
+                try:
+                    self._ledger.finish(proposal.key, "expired")
+                except LedgerUnavailable:
+                    pass  # A surviving reservation still prevents a later invocation.
+                return record("approval", Decision.BLOCK, "approval_expired", "The review period expired.")
         if approved:
             allowed = record("approval", Decision.ALLOW, "user_approved",
-                             "The user approved the reviewed email.")
+                             "The user approved the reviewed action.")
         else:
             allowed = record("alignment", Decision.ALLOW, "aligned_action",
-                             "Policy permits the email and it matches the user request.")
-        # Admission is recorded and pending approval consumed before invoking external code.
+                             "Policy permits the action and it matches the user request.")
+        return self._execute(proposal, tool, allowed)
+
+    def _execute(self, proposal: _Proposal, tool: BoundTool, allowed: ToolResult) -> ToolResult:
         start = perf_counter()
+        output = None
         try:
-            tool.send(proposal.request.arguments)
+            output = tool.execute()
+            if inspect.isawaitable(output):
+                if inspect.iscoroutine(output):
+                    output.close()
+                raise TypeError("Tool execution must be synchronous.")
             execution = Execution.SUCCEEDED
         except Exception:
             execution = Execution.FAILED
-        with self._lock:
-            self._events.append(Event(datetime.now(timezone.utc), "execution", Decision.ALLOW,
-                                      f"execution_{execution.value}", (perf_counter() - start) * 1000,
-                                      proposal.name, proposal.id, execution))
+        reason = f"execution_{execution.value}"
+        explanation = allowed.explanation
         if execution is Execution.FAILED:
-            return replace(allowed, execution=execution,
-                           explanation=f"{allowed.explanation} The sender raised an error.")
-        return replace(allowed, execution=execution)
+            explanation += " The tool raised an error or returned an unsupported awaitable."
+        recorded = None
+        if self._ledger is not None and proposal.key is not None:
+            try:
+                self._ledger.finish(proposal.key, execution)
+                recorded = True
+            except LedgerUnavailable:
+                recorded = False
+                reason = "outcome_unrecorded"
+                explanation += " The outcome could not be written to the ledger. Reconcile the operation."
+        with self._lock:
+            self._executions[execution] += 1
+            self._events.append(Event(datetime.now(timezone.utc), "execution", Decision.ALLOW, reason,
+                                      (perf_counter() - start) * 1000, proposal.name, proposal.id,
+                                      execution))
+        result = replace(allowed, execution=execution, explanation=explanation, outcome_recorded=recorded)
+        if tool.return_text and execution is Execution.SUCCEEDED:
+            scan = self._scan(Direction.OUTPUT, output, proposal=proposal)
+            return replace(result, output_scan=scan,
+                           output_text=output if scan.decision is Decision.ALLOW else None)
+        return result
 
     def _record(self, proposal: _Proposal, start: float, stage: str, decision: Decision,
                 reason: str, explanation: str, permission: Permission | None,
                 alignment: Alignment | None) -> ToolResult:
-        summary = None
-        if decision is Decision.REVIEW:
-            summary = f"Send email via {proposal.name}: {proposal.request.arguments.preview()}"
-        result = ToolResult(proposal.id, stage, proposal.name, decision, reason, explanation,
-                            permission, alignment, review_summary=summary)
         with self._lock:
+            summary = None
+            if decision is Decision.REVIEW:
+                if proposal.result is not None and self._clock() >= proposal.deadline:
+                    stage, decision, reason = "approval", Decision.BLOCK, "approval_expired"
+                    explanation = "The review period expired."
+                elif proposal.result is None and len(self._pending) >= self._max_pending:
+                    stage, decision, reason = "admission", Decision.BLOCK, "review_queue_full"
+                    explanation = "There is no room for another pending review."
+                else:
+                    if proposal.result is None:
+                        proposal.deadline = self._clock() + self._ttl
+                    summary = f"{proposal.name} {proposal.request.arguments.preview()}"
+            result = ToolResult(proposal.id, stage, proposal.name, decision, reason, explanation,
+                                permission, alignment, review_summary=summary)
             if proposal.result:
                 self._decisions[proposal.result.decision] -= 1
             self._decisions[decision] += 1
@@ -219,11 +301,35 @@ class Guard:
                                       permission=permission, alignment=alignment))
         return result
 
-    def stats(self) -> Stats:
+    def _expire_pending(self) -> None:
+        now = self._clock()
         with self._lock:
-            stages = Counter(event.stage for event in self._events)
-            reasons = Counter(event.reason_code for event in self._events)
-            return Stats(stages["input"], stages["output"], reasons["content_flagged"],
-                         reasons["scanner_unavailable"], self._decisions[Decision.ALLOW],
-                         self._decisions[Decision.BLOCK], self._decisions[Decision.REVIEW],
-                         reasons["execution_succeeded"], reasons["execution_failed"])
+            expired = [p for p in self._pending.values() if p.deadline <= now]
+        for proposal in expired:
+            # Never block an observer on an application callback or a concurrent approval.
+            if proposal.lock.acquire(blocking=False):
+                try:
+                    result = proposal.result
+                    if result is not None and result.decision is Decision.REVIEW:
+                        self._record(proposal, perf_counter(), "approval", Decision.BLOCK,
+                                     "approval_expired", "The review period expired.",
+                                     result.permission, result.alignment)
+                finally:
+                    proposal.lock.release()
+
+    def pending_reviews(self) -> tuple[ToolResult, ...]:
+        """Private review snapshots for this guard's authenticated owner."""
+        self._expire_pending()
+        with self._lock:
+            now = self._clock()
+            return tuple(p.result for p in self._pending.values()
+                         if p.result is not None and p.deadline > now)
+
+    def stats(self) -> Stats:
+        self._expire_pending()
+        with self._lock:
+            return Stats(self._scan_directions[Direction.INPUT], self._scan_directions[Direction.OUTPUT],
+                         self._verdicts[Verdict.UNSAFE], self._verdicts[Verdict.UNAVAILABLE],
+                         self._decisions[Decision.ALLOW], self._decisions[Decision.BLOCK],
+                         self._decisions[Decision.REVIEW], self._executions[Execution.SUCCEEDED],
+                         self._executions[Execution.FAILED])
