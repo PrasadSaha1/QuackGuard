@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -42,10 +43,15 @@ def _post(endpoint: str, payload: dict, token: str, timeout: float) -> object:
     with requests.Session() as session:
         session.trust_env = False
         response = session.post(endpoint, json=payload, headers={"Authorization": f"Bearer {token}"},
-                                timeout=timeout, allow_redirects=False)
+                                timeout=timeout, allow_redirects=False, stream=True)
         if response.status_code != 200:
             return None
-        return response.json()
+        body = bytearray()
+        for chunk in response.iter_content(8192):
+            if len(body) + len(chunk) > 65_536:
+                return None
+            body.extend(chunk)
+        return json.loads(body)
 
 
 def _parse(response: object) -> Classification:

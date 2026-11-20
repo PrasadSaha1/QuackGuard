@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
+from .arguments import Arguments, JSONObject, JSONValue
+
 
 class Decision(StrEnum):
     ALLOW = "ALLOW"
@@ -102,17 +104,24 @@ class Email:
                           ensure_ascii=True)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class ToolRequest:
     user_request: str = field(repr=False)
     tool_name: str
-    arguments: Email = field(repr=False)
+    arguments: Email | Arguments = field(repr=False)
 
-    def __post_init__(self) -> None:
-        if type(self.user_request) is not str or not self.user_request.strip():
-            raise ValueError("A trusted user request is required.")
-        if type(self.tool_name) is not str or type(self.arguments) is not Email:
-            raise ValueError("Expected a tool name and validated email arguments.")
+    def __init__(self, user_request: str, tool_name: str, arguments: Email | Arguments | JSONObject):
+        if type(user_request) is not str or not user_request.strip() or len(user_request) > 65_536:
+            raise ValueError("Supply a nonempty trusted user request of up to 65536 characters.")
+        if type(tool_name) is not str:
+            raise ValueError("Expected a tool name.")
+        if type(arguments) is dict:
+            arguments = Arguments(arguments)
+        if type(arguments) not in (Email, Arguments):
+            raise ValueError("Expected email arguments or a JSON object.")
+        object.__setattr__(self, "user_request", user_request)
+        object.__setattr__(self, "tool_name", tool_name)
+        object.__setattr__(self, "arguments", arguments)
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +145,9 @@ class ToolResult:
     alignment: Alignment | None
     execution: Execution = Execution.UNCALLED
     review_summary: str | None = field(default=None, repr=False)
+    outcome_recorded: bool | None = None
+    output_scan: ScanResult | None = None
+    output_text: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
