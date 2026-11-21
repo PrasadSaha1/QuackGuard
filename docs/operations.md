@@ -80,6 +80,30 @@ A pending review ends after `review_ttl` seconds from its first hold (default 30
 
 Set `max_events` and `max_pending` to suit the process memory budget. A full review queue blocks new holds with `review_queue_full`. Older events leave the ring buffer in insertion order. `stats()` retains per-guard lifetime counts. Monitor unavailable checks, queue saturation, execution failures and unrecorded outcomes. Keep private previews and request objects out of telemetry. Aggregate counts across workers in your application if needed.
 
+### JSON stats snapshots
+
+Set `Guard(..., stats_path=path)` to publish a readable file immediately. QuackGuard creates missing parent directories and replaces the destination with a fresh zero-count snapshot on startup. Use a dedicated path in an application-owned directory on a local filesystem. Each scan, decision, and execution refreshes the file synchronously. A reader that opens it during an update sees a complete old or new document. A process interruption can leave the last published snapshot behind. Use one writer per path across guards and workers.
+
+| JSON field | Meaning |
+| --- | --- |
+| `schema_version` | Integer format version, currently 1. |
+| `updated_at` | ISO 8601 UTC time when the guard captured the counters and event window together. |
+| `stats.scanned_inputs`, `stats.scanned_outputs` | Number of scans by direction, including guarded tool output checks. |
+| `stats.flagged_scans`, `stats.unavailable_scans` | Scan outcomes across both directions. |
+| `stats.allowed_proposals`, `stats.blocked_proposals`, `stats.held_proposals` | Each proposal appears once under its current decision. Approval, denial and expiry move it between counters. |
+| `stats.executions_succeeded`, `stats.executions_failed` | Actual tool attempts grouped by outcome. An allowed proposal can be visible while its tool is still running. |
+| `events` | Optional array of up to `max_events` recent redacted events, oldest first. Includes UTC timestamp, stage, decision, reason code, duration in milliseconds, registered tool name, proposal ID, execution, permission, and alignment. |
+
+Use `stats_include_events=True` to include the event window with each update. Counts continue beyond that window. Prompts, outputs, tool arguments, credentials, provider bodies, and private review summaries stay out of the file. Restrict access to the monitoring directory if tool names, identifiers or activity volumes are sensitive.
+
+Choose manual publication for high-volume services. Leave `stats_path` unset and call `guard.save_stats(path, include_events=False)` at your own checkpoint or interval. This returns the absolute path. With a live target, `guard.save_stats()` refreshes that file on demand. It also checks for expired idle reviews. While the application is idle, time passing alone triggers no publication.
+
+An unusable live path raises `OSError` at construction. If a later automatic update fails, the caller still receives the guard's decision and execution outcome. Inspect `guard.stats_write_failed` to detect a stale file. Fix the destination and call `guard.save_stats()` to retry publication of the current totals. A successful live write clears the flag. Explicit saves propagate I/O errors. Retrying publication never reruns a tool. File contents are read by monitoring clients only. Guard policy, approvals and execution reservations come from the live application and its configured ledger.
+
+For comparisons across restarts, archive the file or allocate a separate path per run. Initialize downstream counters anew when starting another guard on the same path.
+
+### Verify a deployment
+
 Before enabling a real tool, run the automated checks with synthetic data and exercise its integration in staging. Test your identity mapping, schema, resource permissions, approval UI, downstream timeouts and reconciliation procedure. For a remote scanner, also validate role-specific classifications, timeout behavior, model category compatibility, provider privacy settings and latency against the actual deployment. The offline fixtures exercise control flow. Detection accuracy and service capacity require measurements on your workload.
 
 ```sh
