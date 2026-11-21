@@ -36,6 +36,34 @@ printf 'allow\ndeny\n' | python examples/offline_demo.py
 
 The fifth proposal has no alignment fixture and stays pending. Pressing Enter or reaching end of input at an approval prompt also leaves that proposal pending. Fixtures demonstrate package behavior. They do not measure a model's detection accuracy.
 
+## View and export stats as JSON
+
+Run the offline demo with a snapshot path, then open the file in your editor or print it in the terminal. You can also read it from another terminal while the demo waits for approval. Watch `held_proposals` decrease when you approve or deny the action.
+
+```sh
+python examples/offline_demo.py --stats-json var/quackguard/stats.json
+python -m json.tool var/quackguard/stats.json
+```
+
+Pass `stats_path` to any guard to publish all nine counters on startup and after every scan, proposal decision, and execution. Each document has a `schema_version`, a UTC `updated_at` timestamp, and a `stats` object with the same field names as `guard.stats()`.
+
+```python
+import json
+from pathlib import Path
+from quackguard import DemoScanner, Guard
+
+path = Path("var/quackguard/stats.json")
+guard = Guard(DemoScanner(), stats_path=path)
+guard.scan_output("[flagged output fixture]")
+counts = json.loads(path.read_text(encoding="utf-8"))["stats"]
+print(counts["flagged_scans"])  # 1
+
+# Export a separate copy with the most recent redacted events.
+guard.save_stats("var/quackguard/inspection.json", include_events=True)
+```
+
+For manual or periodic exports, omit `stats_path` and call `guard.save_stats(path)` when your application chooses. Enable recent events in the live file with `stats_include_events=True` or the demo's `--include-events` flag. Give each running guard a dedicated file. [Snapshot schema, failure handling and restarts](docs/operations.md#json-stats-snapshots)
+
 ## Register an application tool
 
 This example assumes the user submitted a structured form to save a note. The application keeps the accepted form fields separately from the proposal produced by the agent.
