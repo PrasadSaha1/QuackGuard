@@ -9,10 +9,12 @@ from collections import Counter, deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Lock
 from time import monotonic, perf_counter
 from uuid import uuid4
 
+from ._snapshot import write_snapshot
 from .ledger import LedgerUnavailable, SQLiteLedger
 from .scanners import Scanner
 from .tools import AlignmentCheck, BoundTool, EmailTool, Tool
@@ -44,7 +46,8 @@ class Guard:
     def __init__(self, scanner: Scanner, *, tools: Mapping[str, Tool | EmailTool] | None = None,
                  alignment: AlignmentCheck | None = None, review_ttl: float = 300,
                  clock: Callable[[], float] = monotonic, ledger: SQLiteLedger | None = None,
-                 max_events: int = 1000, max_pending: int = 256):
+                 max_events: int = 1000, max_pending: int = 256,
+                 stats_path: str | Path | None = None, stats_include_events: bool = False):
         self._scanner = scanner
         self._tools = dict(tools or {})
         if any(type(name) is not str or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name)
@@ -66,6 +69,14 @@ class Guard:
         self._verdicts: Counter[Verdict] = Counter()
         self._executions: Counter[Execution] = Counter()
         self._decisions: Counter[Decision] = Counter()
+        self._stats_path = Path(stats_path).absolute() if stats_path is not None else None
+        if type(stats_include_events) is not bool:
+            raise TypeError("stats_include_events must be a boolean.")
+        self._stats_include_events = stats_include_events
+        self._snapshot_lock = Lock()
+        self._stats_write_failed = False
+        if self._stats_path is not None:
+            self._write_stats(self._stats_path, self._stats_include_events)
 
     @property
     def events(self) -> tuple[Event, ...]:
@@ -95,6 +106,7 @@ class Guard:
                                       proposal.name if proposal else None, proposal.id if proposal else None))
             self._scan_directions[direction] += 1
             self._verdicts[classification.verdict] += 1
+        self._publish_stats()
         return ScanResult(direction, classification.verdict, decision, reason, explanation,
                           classification.categories)
 
@@ -263,6 +275,7 @@ class Guard:
             self._events.append(Event(datetime.now(timezone.utc), "execution", Decision.ALLOW, reason,
                                       (perf_counter() - start) * 1000, proposal.name, proposal.id,
                                       execution))
+        self._publish_stats()
         result = replace(allowed, execution=execution, explanation=explanation, outcome_recorded=recorded)
         if tool.return_text and execution is Execution.SUCCEEDED:
             scan = self._scan(Direction.OUTPUT, output, proposal=proposal)
@@ -299,6 +312,7 @@ class Guard:
             self._events.append(Event(datetime.now(timezone.utc), stage, decision, reason,
                                       (perf_counter() - start) * 1000, proposal.name, proposal.id,
                                       permission=permission, alignment=alignment))
+        self._publish_stats()
         return result
 
     def _expire_pending(self) -> None:
@@ -328,8 +342,52 @@ class Guard:
     def stats(self) -> Stats:
         self._expire_pending()
         with self._lock:
-            return Stats(self._scan_directions[Direction.INPUT], self._scan_directions[Direction.OUTPUT],
-                         self._verdicts[Verdict.UNSAFE], self._verdicts[Verdict.UNAVAILABLE],
-                         self._decisions[Decision.ALLOW], self._decisions[Decision.BLOCK],
-                         self._decisions[Decision.REVIEW], self._executions[Execution.SUCCEEDED],
-                         self._executions[Execution.FAILED])
+            return self._stats_locked()
+
+    def _stats_locked(self) -> Stats:
+        return Stats(self._scan_directions[Direction.INPUT], self._scan_directions[Direction.OUTPUT],
+                     self._verdicts[Verdict.UNSAFE], self._verdicts[Verdict.UNAVAILABLE],
+                     self._decisions[Decision.ALLOW], self._decisions[Decision.BLOCK],
+                     self._decisions[Decision.REVIEW], self._executions[Execution.SUCCEEDED],
+                     self._executions[Execution.FAILED])
+
+    @property
+    def stats_write_failed(self) -> bool:
+        """Whether the latest write to the configured live snapshot failed."""
+        with self._snapshot_lock:
+            return self._stats_write_failed
+
+    def save_stats(self, path: str | Path | None = None, *, include_events: bool | None = None) -> Path:
+        """Export current counts and optionally recent redacted events. Raises OSError on I/O failure."""
+        destination = self._stats_path if path is None else Path(path).absolute()
+        if destination is None:
+            raise ValueError("Supply a snapshot path or configure stats_path on the guard.")
+        if include_events is not None and type(include_events) is not bool:
+            raise TypeError("include_events must be a boolean.")
+        self._expire_pending()
+        self._write_stats(destination, self._stats_include_events if include_events is None else include_events)
+        return destination
+
+    def _publish_stats(self) -> None:
+        if self._stats_path is not None:
+            try:
+                self._write_stats(self._stats_path, self._stats_include_events)
+            except OSError:
+                # Monitoring failure must not turn a completed tool call into a retry.
+                pass
+
+    def _write_stats(self, path: Path, include_events: bool) -> None:
+        # Capture *after* taking the writer lock so a slower writer cannot publish older counts.
+        with self._snapshot_lock:
+            with self._lock:
+                captured = datetime.now(timezone.utc)
+                stats = self._stats_locked()
+                events = tuple(self._events) if include_events else None
+            try:
+                write_snapshot(path, captured, stats, events)
+            except OSError:
+                if path == self._stats_path:
+                    self._stats_write_failed = True
+                raise
+            if path == self._stats_path:
+                self._stats_write_failed = False
