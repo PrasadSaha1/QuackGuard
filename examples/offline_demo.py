@@ -1,6 +1,8 @@
 """Student assistant walkthrough. Every message and mailbox here is synthetic."""
 
+import argparse
 from dataclasses import asdict
+from pathlib import Path
 
 from quackguard import (
     Alignment, Decision, DemoScanner, Email, EmailTool, FixtureAlignment, Guard,
@@ -36,7 +38,7 @@ def ask_user(guard: Guard, request: ToolRequest) -> None:
     show(guard.review(held.proposal_id, request, choice))
 
 
-def main() -> None:
+def main(stats_path: Path | None = None, include_events: bool = False) -> None:
     inbox: list[Email] = []
     team = Email("team@example.test", "Quiz date", "The sample quiz is on Friday.")
     guest = Email("guest@example.test", "Study session", "The sample session starts at noon.")
@@ -54,7 +56,8 @@ def main() -> None:
         return {"team@example.test": Permission.ALLOW, "archive@example.test": Permission.ALLOW,
                 "guest@example.test": Permission.ASK}.get(email.recipient, Permission.DENY)
 
-    guard = Guard(DemoScanner(), tools={"send_email": EmailTool(inbox.append, permission)},
+    guard = Guard(DemoScanner(), stats_path=stats_path, stats_include_events=include_events,
+                  tools={"send_email": EmailTool(inbox.append, permission)},
                   alignment=FixtureAlignment({recap: Alignment.ALIGNED, conflict: Alignment.MISALIGNED,
                                               invite: Alignment.ALIGNED, followup: Alignment.ALIGNED}))
 
@@ -79,7 +82,15 @@ def main() -> None:
     for name, count in asdict(guard.stats()).items():
         print(f"  {name}: {count}")
     print(f"Messages in the fake mailbox: {len(inbox)}")
+    if stats_path is not None:
+        print(f"JSON snapshot: {guard.save_stats()}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--stats-json", type=Path, metavar="PATH", help="Publish live stats to this file.")
+    parser.add_argument("--include-events", action="store_true", help="Include recent redacted events.")
+    args = parser.parse_args()
+    if args.include_events and args.stats_json is None:
+        parser.error("--include-events requires --stats-json")
+    main(args.stats_json, args.include_events)
